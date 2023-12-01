@@ -1,0 +1,174 @@
+#!/bin/bash
+
+function log_error {
+  local message=$1
+
+  if [[ $TERM == *"color"* ]]; then
+    echo -e "\e[31m$message\e[0m"
+  else
+    echo "${message}"
+  fi
+}
+
+function log_info {
+  local message=$1
+
+  if [[ $TERM == *"color"* ]]; then
+    echo -e "\e[32m$message\e[0m"
+  else
+    echo "${message}"
+  fi
+}
+
+function log_debug {
+  local message=$1
+
+  if [[ $TERM == *"color"* ]]; then
+    echo -e "\e[33m${message}\e[0m"
+  else
+    echo "${message}"
+  fi
+}
+
+function exists {
+  if which "$1" >/dev/null 2>&1; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Check if the correct number of arguments was provided
+if [[ $# -lt 4 ]] || [[ $# -gt 5 ]]; then
+  echo "NOTE: You should run the command with sudo as it starts the systemd service."
+  echo "Usage: $0 <K8SENSOR_SERVER> <K8SENSOR_TOKEN> <BACKEND> <BACKEND_KEY> <K8SENSOR_TARGET_ZONE>"
+  echo "<K8SENSOR_SERVER>: The url of the K8S cluster to be monitored. e.g. \"https://console-openshift-console.apps.bowings.cp.fyre.ibm.com:6443\""
+  echo "<K8SENSOR_TOKEN>: The OAuth token for the user or serviceaccount."
+  echo "<BACKEND>: The AIOps Insight Backend URL. e.g. 'https://connector.apps.itom-dev-2.vjgp.p1.openshiftapps.com:443'"
+  echo "<BACKEND_KEY>: The key for the AIOps Insight Backend."
+  echo "<K8SENSOR_TARGET_ZONE>: The zone name to represent the K8S cluster on the UI. e.g. 'my-k8s'"
+  exit 1
+fi
+
+# Assign arguments to variables
+AGENT_DIR="/opt/instana/agent"
+CONTAINER_ENGINE=podman
+K8SENSOR_IMAGE="icr.io/instana/k8sensor"
+K8SENSOR_SERVER=$1
+K8SENSOR_TOKEN=$2
+BACKEND=$3
+INSTANA_AGENT_KEY=$4
+K8SENSOR_TARGET_ZONE=$5
+
+# Check Podman
+if ! exists $CONTAINER_ENGINE; then
+    log_error "$CONTAINER_ENGINE is not installed. K8sensor service won't be installed."
+    return
+fi
+
+# Check for Systemd
+init_system=$(ps --no-headers -o comm 1)
+
+if [[ "${init_system,,}" != "systemd" ]]; then
+    log_error "The init system is not systemd (it's ${init_system}). K8sensor service won't be installed."
+    return
+fi
+
+
+log_info "Preprocess the inputs"
+HOSTNAME=$(echo "$K8SENSOR_SERVER" | awk -F[/:] '{print $4}') #extract hostname
+PORT=$(echo "$K8SENSOR_SERVER" | awk -F[/:] '{print $5}') #extract post
+
+# Check if a port was included in the URL; if not, set a default port
+if [ -z "$PORT" ]; then
+PORT="6443" # default port for Kubernetes API server
+fi
+
+
+# BACKEND="https://${INSTANA_AGENT_HOST#*.}:${INSTANA_AGENT_PORT}" # remove the tenant and unit from the backend url
+CLUSTER_NAME="${HOSTNAME}:${PORT}"
+CONFIG_FOLDER="${AGENT_DIR}/etc/k8sensor"
+mkdir -p ${CONFIG_FOLDER}
+KUBE_CONFIG_PATH="${CONFIG_FOLDER}/${HOSTNAME}.config"  #The kube.config path. Might not work for non-linux system
+SYSTEMD_SERVICE_NAME="insight-k8sensor-${HOSTNAME}"
+SYSTEMD_CONFIG_PATH="${CONFIG_FOLDER}/${SYSTEMD_SERVICE_NAME}.service"
+
+if [[ -n $INSIGHT_K8SENSOR_DEBUG ]] && [[ $INSIGHT_K8SENSOR_DEBUG == "True" ]]; then
+  log_debug "***********************************************"
+  log_debug K8SENSOR_SERVER=$K8SENSOR_SERVER
+  log_debug K8SENSOR_TOKEN=$K8SENSOR_TOKEN
+  log_debug BACKEND=$BACKEND
+  log_debug INSTANA_AGENT_KEY=$INSTANA_AGENT_KEY
+  log_debug K8SENSOR_TARGET_ZONE=$K8SENSOR_TARGET_ZONE
+  log_debug CLUSTER_NAME=$CLUSTER_NAME
+  log_debug CONFIG_FOLDER=$CONFIG_FOLDER
+  log_debug KUBE_CONFIG_PATH=$KUBE_CONFIG_PATH
+  log_debug SYSTEMD_SERVICE_NAME=$SYSTEMD_SERVICE_NAME
+  log_debug SYSTEMD_CONFIG_PATH=$SYSTEMD_CONFIG_PATH
+  log_debug "***********************************************"
+fi
+
+KUBECONFIG_CONTENT=$(cat <<EOF
+apiVersion: v1
+clusters:
+- cluster:
+    insecure-skip-tls-verify: true
+    server: $K8SENSOR_SERVER
+  name: $CLUSTER_NAME
+contexts:
+- context:
+    cluster: $CLUSTER_NAME
+    user: user/$CLUSTER_NAME
+  name: $CLUSTER_NAME
+current-context: $CLUSTER_NAME
+kind: Config
+preferences: {}
+users:
+- name: user/$CLUSTER_NAME
+  user:
+    token: $K8SENSOR_TOKEN
+EOF
+)
+
+log_info "Generate kubeconfig"
+echo "$KUBECONFIG_CONTENT" > "$KUBE_CONFIG_PATH"
+
+log_info "Pull the latest image"
+$CONTAINER_ENGINE pull $K8SENSOR_IMAGE:"latest"
+
+log_info "Try running the k8sensor containers ${SYSTEMD_SERVICE_NAME}"
+if [[ -n $K8SENSOR_TARGET_ZONE ]]; then
+  $CONTAINER_ENGINE run --name="${SYSTEMD_SERVICE_NAME}" -d --rm -v "$KUBE_CONFIG_PATH":/root/config $K8SENSOR_IMAGE -backend "$BACKEND" -key "$INSTANA_AGENT_KEY" -kubeconfig /root/config -zone "$K8SENSOR_TARGET_ZONE"
+else
+  $CONTAINER_ENGINE run --name="${SYSTEMD_SERVICE_NAME}" -d --rm -v "$KUBE_CONFIG_PATH":/root/config $K8SENSOR_IMAGE -backend "$BACKEND" -key "$INSTANA_AGENT_KEY" -kubeconfig /root/config
+fi
+
+
+if ! $CONTAINER_ENGINE ps | grep -q "$SYSTEMD_SERVICE_NAME"; then
+    log_info "No container is running from the image $SYSTEMD_SERVICE_NAME."
+    log_info "Need to debug " $CONTAINER_ENGINE run --name="${SYSTEMD_SERVICE_NAME}" -d --rm -v "$KUBE_CONFIG_PATH":/root/config $K8SENSOR_IMAGE -backend "$BACKEND" -key "$INSTANA_AGENT_KEY" -kubeconfig /root/config -zone "$K8SENSOR_TARGET_ZONE" 
+    log_info "K8sensor service won't be installed."
+    return
+fi
+
+
+log_info "Convert the container to systemd service"
+$CONTAINER_ENGINE generate systemd --new --name "${SYSTEMD_SERVICE_NAME}" --container-prefix "k8sensor" > "${SYSTEMD_CONFIG_PATH}"
+
+log_info "Stop the container"
+$CONTAINER_ENGINE stop "${SYSTEMD_SERVICE_NAME}"
+
+log_info "Add the service to systemd"
+cp "${SYSTEMD_CONFIG_PATH}" /etc/systemd/system/
+
+log_info "Reload the service list"
+systemctl daemon-reload
+
+log_info "Enable the service: ${SYSTEMD_SERVICE_NAME}.service"
+systemctl enable "${SYSTEMD_SERVICE_NAME}.service"
+
+log_info "Start the service: ${SYSTEMD_SERVICE_NAME}.service"
+systemctl start "${SYSTEMD_SERVICE_NAME}.service"
+
+# keep the service running when user logged out
+loginctl enable-linger

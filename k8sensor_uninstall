@@ -1,0 +1,57 @@
+#!/bin/bash
+
+service_prefix="insight-k8sensor"
+suffix=".config"
+config_path="/opt/instana/agent/etc/k8sensor/"
+CONTAINER_ENGINE=podman
+
+function exists {
+  if which "$1" >/dev/null 2>&1; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Check if config_path exists and is a directory
+if [ ! -d "$config_path" ]; then
+    echo "Directory $config_path does not exist."
+    exit 1
+fi
+
+# Check if there are any files with the given suffix
+shopt -s nullglob
+filelist=("$config_path"/*"$suffix")
+if [ ${#filelist[@]} -eq 0 ]; then
+    echo "No files with suffix $suffix found in $config_path."
+    exit 1
+fi
+
+# Check Podman
+if ! exists $CONTAINER_ENGINE; then
+    echo "$CONTAINER_ENGINE is not installed."
+    exit 1
+fi
+
+
+for filepath in "$config_path"/*"$suffix"; do
+    filename=$(basename "$filepath")
+    service="${filename%$suffix}"
+
+    echo "Stop the service: ${service_prefix}-${service}.service"
+    systemctl stop -q ${service_prefix}-${service}.service > /dev/null 2>&1
+    systemctl disable -q ${service_prefix}-${service}.service > /dev/null 2>&1
+    systemctl reset-failed -q > /dev/null 2>&1
+    systemctl daemon-reload -q > /dev/null 2>&1
+
+    $CONTAINER_ENGINE stop "${service_prefix}-${service}" > /dev/null 2>&1
+    $CONTAINER_ENGINE rm "${service_prefix}-${service}" > /dev/null 2>&1
+
+    echo "Removing /etc/systemd/system/${service_prefix}-${service}.service"
+    rm /etc/systemd/system/${service_prefix}-${service}.service  > /dev/null 2>&1
+    echo "Removing /opt/instana/agent/etc/k8sensor/${service}.config"
+    rm "/opt/instana/agent/etc/k8sensor/${service}.config"  > /dev/null 2>&1
+done
+
+# Reset nullglob back to its default state
+shopt -u nullglob

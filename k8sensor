@@ -41,12 +41,12 @@ function exists {
 # Check if the correct number of arguments was provided
 if [[ $# -lt 4 ]] || [[ $# -gt 5 ]]; then
   echo "NOTE: You should run the command with sudo as it starts the systemd service."
-  echo "Usage: $0 <K8SENSOR_SERVER> <K8SENSOR_TOKEN> <BACKEND> <BACKEND_KEY> <K8SENSOR_TARGET_ZONE>"
+  echo "Usage: $0 <K8SENSOR_SERVER> <K8SENSOR_TOKEN> <BACKEND> <BACKEND_KEY> <K8SENSOR_CLUSTER_NAME>"
   echo "<K8SENSOR_SERVER>: The url of the K8S cluster to be monitored. e.g. \"https://console-openshift-console.apps.bowings.cp.fyre.ibm.com:6443\""
   echo "<K8SENSOR_TOKEN>: The OAuth token for the user or serviceaccount."
   echo "<BACKEND>: The AIOps Insight Backend URL. e.g. 'https://connector.apps.itom-dev-2.vjgp.p1.openshiftapps.com:443'"
   echo "<BACKEND_KEY>: The key for the AIOps Insight Backend."
-  echo "<K8SENSOR_TARGET_ZONE>: The zone name to represent the K8S cluster on the UI. e.g. 'my-k8s'"
+  echo "<K8SENSOR_CLUSTER_NAME>: The zone name to represent the K8S cluster on the UI. e.g. 'my-k8s'"
   exit 1
 fi
 
@@ -54,24 +54,38 @@ fi
 AGENT_DIR="/opt/instana/agent"
 CONTAINER_ENGINE=podman
 K8SENSOR_IMAGE="icr.io/instana/k8sensor"
+MIN_PODMAN_VERSION=4
 K8SENSOR_SERVER=$1
 K8SENSOR_TOKEN=$2
 BACKEND=$3
 INSTANA_AGENT_KEY=$4
-K8SENSOR_TARGET_ZONE=$5
+K8SENSOR_CLUSTER_NAME=$5
 
 # Check Podman
 if ! exists $CONTAINER_ENGINE; then
     log_error "$CONTAINER_ENGINE is not installed. K8sensor service won't be installed."
-    return
+    exit 1
 fi
+
+# Get the Podman version
+PODMAN_VERSION=$($CONTAINER_ENGINE --version | awk '{print $3}')
+
+# Extract major version
+MAJOR_VERSION=$(echo "${PODMAN_VERSION}" | cut -d '.' -f1)
+
+# Check if the major version is less than minimum version
+if [ "${MAJOR_VERSION}" -lt "${MIN_PODMAN_VERSION}" ]; then
+    log_error "Error: Podman version is less than ${MIN_PODMAN_VERSION} (version found: $PODMAN_VERSION)."
+    exit 1
+fi
+
 
 # Check for Systemd
 init_system=$(ps --no-headers -o comm 1)
 
 if [[ "${init_system,,}" != "systemd" ]]; then
     log_error "The init system is not systemd (it's ${init_system}). K8sensor service won't be installed."
-    return
+    exit 1
 fi
 
 
@@ -86,8 +100,8 @@ fi
 
 
 # BACKEND="https://${INSTANA_AGENT_HOST#*.}:${INSTANA_AGENT_PORT}" # remove the tenant and unit from the backend url
-CLUSTER_NAME="${HOSTNAME}:${PORT}"
-CONFIG_FOLDER="${AGENT_DIR}/etc/k8sensor"
+SERVER="${HOSTNAME}:${PORT}"
+CONFIG_FOLDER="${AGENT_DIR}/k8sensor/etc"
 mkdir -p ${CONFIG_FOLDER}
 KUBE_CONFIG_PATH="${CONFIG_FOLDER}/${HOSTNAME}.config"  #The kube.config path. Might not work for non-linux system
 SYSTEMD_SERVICE_NAME="insight-k8sensor-${HOSTNAME}"
@@ -99,13 +113,38 @@ if [[ -n $INSIGHT_K8SENSOR_DEBUG ]] && [[ $INSIGHT_K8SENSOR_DEBUG == "True" ]]; 
   log_debug K8SENSOR_TOKEN=$K8SENSOR_TOKEN
   log_debug BACKEND=$BACKEND
   log_debug INSTANA_AGENT_KEY=$INSTANA_AGENT_KEY
-  log_debug K8SENSOR_TARGET_ZONE=$K8SENSOR_TARGET_ZONE
-  log_debug CLUSTER_NAME=$CLUSTER_NAME
+  log_debug K8SENSOR_CLUSTER_NAME=$K8SENSOR_CLUSTER_NAME
+  log_debug SERVER=$SERVER
   log_debug CONFIG_FOLDER=$CONFIG_FOLDER
   log_debug KUBE_CONFIG_PATH=$KUBE_CONFIG_PATH
   log_debug SYSTEMD_SERVICE_NAME=$SYSTEMD_SERVICE_NAME
   log_debug SYSTEMD_CONFIG_PATH=$SYSTEMD_CONFIG_PATH
   log_debug "***********************************************"
+fi
+
+
+# Check if the service is running
+if systemctl is-active --quiet "$SYSTEMD_SERVICE_NAME"; then
+    log_info "An existing service $SYSTEMD_SERVICE_NAME is running. k8sensor service won't be installed."
+    log_info "You can run 'sudo systemctl stop $SYSTEMD_SERVICE_NAME' first if you want to reinstall the service."
+    exit 0
+fi
+
+log_info "Pull the latest image"
+$CONTAINER_ENGINE pull $K8SENSOR_IMAGE:"latest"
+
+# Check if the container is running
+if [ "$($CONTAINER_ENGINE ps -q -f name=${SYSTEMD_SERVICE_NAME})" ]; then
+    # Stop the container
+    log_info "Stop the container ${SYSTEMD_SERVICE_NAME}"
+    $CONTAINER_ENGINE stop "${SYSTEMD_SERVICE_NAME}" > /dev/null 2>&1
+fi
+
+# Check if the container exists and is not running, then remove it
+if [ "$($CONTAINER_ENGINE ps -aq -f status=exited -f name=${SYSTEMD_SERVICE_NAME})" ]; then
+    # Remove the stopped container
+    log_info "Remove the container ${SYSTEMD_SERVICE_NAME}"
+    $CONTAINER_ENGINE rm "${SYSTEMD_SERVICE_NAME}" > /dev/null 2>&1
 fi
 
 KUBECONFIG_CONTENT=$(cat <<EOF
@@ -114,17 +153,17 @@ clusters:
 - cluster:
     insecure-skip-tls-verify: true
     server: $K8SENSOR_SERVER
-  name: $CLUSTER_NAME
+  name: $SERVER
 contexts:
 - context:
-    cluster: $CLUSTER_NAME
-    user: user/$CLUSTER_NAME
-  name: $CLUSTER_NAME
-current-context: $CLUSTER_NAME
+    cluster: $SERVER
+    user: user/$SERVER
+  name: $SERVER
+current-context: $SERVER
 kind: Config
 preferences: {}
 users:
-- name: user/$CLUSTER_NAME
+- name: user/$SERVER
   user:
     token: $K8SENSOR_TOKEN
 EOF
@@ -133,22 +172,21 @@ EOF
 log_info "Generate kubeconfig"
 echo "$KUBECONFIG_CONTENT" > "$KUBE_CONFIG_PATH"
 
-log_info "Pull the latest image"
-$CONTAINER_ENGINE pull $K8SENSOR_IMAGE:"latest"
-
 log_info "Try running the k8sensor containers ${SYSTEMD_SERVICE_NAME}"
-if [[ -n $K8SENSOR_TARGET_ZONE ]]; then
-  $CONTAINER_ENGINE run --name="${SYSTEMD_SERVICE_NAME}" -d --rm -v "$KUBE_CONFIG_PATH":/root/config $K8SENSOR_IMAGE -backend "$BACKEND" -key "$INSTANA_AGENT_KEY" -kubeconfig /root/config -zone "$K8SENSOR_TARGET_ZONE"
+if [[ -n $K8SENSOR_CLUSTER_NAME ]]; then
+  $CONTAINER_ENGINE run --name="${SYSTEMD_SERVICE_NAME}" -d -v "$KUBE_CONFIG_PATH":/root/config:ro $K8SENSOR_IMAGE -backend "$BACKEND" -key "$INSTANA_AGENT_KEY" -kubeconfig /root/config -zone "$K8SENSOR_CLUSTER_NAME"
 else
-  $CONTAINER_ENGINE run --name="${SYSTEMD_SERVICE_NAME}" -d --rm -v "$KUBE_CONFIG_PATH":/root/config $K8SENSOR_IMAGE -backend "$BACKEND" -key "$INSTANA_AGENT_KEY" -kubeconfig /root/config
+  $CONTAINER_ENGINE run --name="${SYSTEMD_SERVICE_NAME}" -d -v "$KUBE_CONFIG_PATH":/root/config:ro $K8SENSOR_IMAGE -backend "$BACKEND" -key "$INSTANA_AGENT_KEY" -kubeconfig /root/config
 fi
 
+# If the configuration is wrong, it should fail quickly
+sleep 10
 
 if ! $CONTAINER_ENGINE ps | grep -q "$SYSTEMD_SERVICE_NAME"; then
-    log_info "No container is running from the image $SYSTEMD_SERVICE_NAME."
-    log_info "Need to debug " $CONTAINER_ENGINE run --name="${SYSTEMD_SERVICE_NAME}" -d --rm -v "$KUBE_CONFIG_PATH":/root/config $K8SENSOR_IMAGE -backend "$BACKEND" -key "$INSTANA_AGENT_KEY" -kubeconfig /root/config -zone "$K8SENSOR_TARGET_ZONE" 
-    log_info "K8sensor service won't be installed."
-    return
+    log_error "No container is running from the image $SYSTEMD_SERVICE_NAME."
+    log_error "Need to debug from the logs 'podman logs $SYSTEMD_SERVICE_NAME'" 
+    log_error "K8sensor service won't be installed."
+    exit 1
 fi
 
 
@@ -157,6 +195,9 @@ $CONTAINER_ENGINE generate systemd --new --name "${SYSTEMD_SERVICE_NAME}" --cont
 
 log_info "Stop the container"
 $CONTAINER_ENGINE stop "${SYSTEMD_SERVICE_NAME}"
+
+log_info "Remove the container"
+$CONTAINER_ENGINE rm "${CONTAINER_NAME}" > /dev/null 2>&1
 
 log_info "Add the service to systemd"
 cp "${SYSTEMD_CONFIG_PATH}" /etc/systemd/system/

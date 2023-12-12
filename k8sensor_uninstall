@@ -2,7 +2,7 @@
 
 service_prefix="insight-k8sensor"
 suffix=".config"
-config_path="/opt/instana/agent/etc/k8sensor/"
+config_path="/opt/instana/agent/k8sensor/etc/"
 CONTAINER_ENGINE=podman
 
 function exists {

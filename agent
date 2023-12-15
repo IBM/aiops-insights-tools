@@ -283,6 +283,35 @@ function use_internal_packages () {
   fi
 }
 
+function check_existing_agent () {
+
+  INSTANA_AGENT_INFO=
+  case "$FAMILY" in
+  'apt')
+    INSTANA_AGENT_INFO=$(dpkg -l | grep '^ii' | grep instana-agent-$AGENT_TYPE  | awk '{print $2 " (" $3 ")"}')
+    ;;
+
+  'dnf')
+    INSTANA_AGENT_INFO=$(dnf list installed | grep instana-agent-$AGENT_TYPE | awk '{print $1 " (" $2 ")"}')
+    ;;
+
+  'yum')
+    INSTANA_AGENT_INFO=$(yum list installed | grep instana-agent-$AGENT_TYPE | awk '{print $1 " (" $2 ")"}')
+    ;;
+
+  'zypper')
+    INSTANA_AGENT_INFO=$(zypper se --installed-only | grep instana-agent-$AGENT_TYPE | awk '{print $3}')
+    ;;
+
+  esac
+
+  if [[ -n "$INSTANA_AGENT_INFO" ]]; then
+    echo "An existing Instana Agent is installed: $INSTANA_AGENT_INFO"
+    echo "It will be updated to the current version."
+  fi
+
+}
+
 function setup_agent() {
   local gpg_uri="https://${PKG_URI}/Instana.gpg"
 
@@ -855,6 +884,7 @@ echo "Setting up the ${AGENT_TYPE} AIOps Insights agent for $OS"
 if [ $PROMPT = false ]; then
   response=y
 else
+  check_existing_agent
   if ! receive_confirmation "Are you sure?"; then
     exit 1
   fi
